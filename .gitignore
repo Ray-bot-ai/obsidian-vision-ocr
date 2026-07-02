@@ -1,1 +1,6 @@
 .DS_Store
+paddleocr.env
+.paddleocr.env
+*.log
+__pycache__/
+*.pyc

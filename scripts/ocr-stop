@@ -1,0 +1,10 @@
+#!/bin/bash
+# ocr-stop — 干净停止调度器+看门狗(置停止标志,看门狗检测到后不再重启)，并杀掉当前OCR进程。
+touch "$HOME/ocr-tools/.ocr-stop"
+pkill -f ocr_dispatch.py
+pkill -f paddle_vl_batch_ocr.py
+pkill -f "paddle_ingest.py run"
+pkill -f vision_ocr.py
+sleep 2
+rm -f "$HOME/ocr-tools/.dispatch.lock"
+echo "已停止。（看门狗检测到 .ocr-stop 后不会再重启；下次 ocr-start 会自动清除该标志）"

@@ -1,0 +1,39 @@
+#!/bin/bash
+# ocr-progress — 查看 PaddleOCR 各书进度。用法：~/ocr-tools/ocr-progress
+CACHE="$HOME/ocr-tools/.paddle-cache"
+
+echo "===== 正在运行的 OCR 进程 ====="
+running=$(ps aux | grep -E "paddle_ingest|paddle_vl_batch|vision_ocr" | grep -v grep | grep -v "Claude")
+if [ -z "$running" ]; then
+  echo "  （无 OCR 进程在跑）"
+else
+  echo "$running" | grep -oE "(paddle_ingest\.py|paddle_vl_batch_ocr\.py|vision_ocr\.py).*" | sed 's/--output.*//; s/^/  /'
+fi
+
+echo ""
+echo "===== 各书进度（缓存目录）====="
+[ -d "$CACHE" ] || { echo "  （还没有缓存）"; exit 0; }
+for d in "$CACHE"/*/; do
+  [ -d "$d" ] || continue
+  name=$(basename "$d")
+  cfg="$d/batch_config.json"
+  total=$(grep -o '"total_pages"[^,]*' "$cfg" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+  final=$(ls "$d/markdown_final_v2/"page_*.md 2>/dev/null | wc -l | tr -d ' ')
+  [ -z "$total" ] && total="?"
+  if [ "$total" != "?" ] && [ "$total" -gt 0 ] 2>/dev/null; then
+    pct=$(( final * 100 / total ))
+  else
+    pct="?"
+  fi
+  # 最近一页完成时间
+  last=$(ls -t "$d/markdown_final_v2/"page_*.md 2>/dev/null | head -1)
+  when=""; [ -n "$last" ] && when=$(date -r "$last" +"%H:%M:%S")
+  printf "  %-40s %s/%s 页 (%s%%)  最近: %s\n" "$name" "$final" "$total" "$pct" "$when"
+  # 缺页/复核提示
+  rev="$d/manual_review_list_v2.md"
+  if [ -f "$rev" ]; then
+    nrev=$(grep -cE "page[_ ]?[0-9]" "$rev" 2>/dev/null || true)
+    [ "${nrev:-0}" -gt 0 ] 2>/dev/null && echo "      ⚠ 有 $nrev 处建议复核：$rev"
+  fi
+done
+exit 0

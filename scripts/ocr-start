@@ -1,0 +1,33 @@
+#!/bin/bash
+# ocr-start — 启动双引擎调度器，脱离会话/父进程(setsid)，被反复 kill 也能自动续跑。
+# 看门狗：只要还有待OCR的书且没收到停止信号，就在调度器退出后自动重启(断点续跑)。
+# 停止：~/ocr-tools/ocr-stop
+PY="$HOME/.ocr-vision-venv/bin/python"
+D="$HOME/ocr-tools/ocr_dispatch.py"
+LOG="$HOME/ocr-tools/dispatch.log"
+STOP="$HOME/ocr-tools/.ocr-stop"
+
+rm -f "$STOP"
+if pgrep -f "ocr_dispatch.py run" >/dev/null; then
+  echo "调度器已在运行（不重复启动）。看进度: tail -f $LOG"
+  exit 0
+fi
+
+# macOS 无 setsid；用 nohup+disown 脱离终端，配合插件 spawn 的 detached:true 即独立于会话。
+nohup bash -c '
+  PY="'"$PY"'"; D="'"$D"'"; LOG="'"$LOG"'"; STOP="'"$STOP"'"
+  echo "[watchdog $(date +%H:%M:%S)] 启动" >> "$LOG"
+  for i in $(seq 1 50); do
+    [ -f "$STOP" ] && { echo "[watchdog] 收到停止信号，退出" >> "$LOG"; break; }
+    n=$("$PY" "$D" count 2>/dev/null)
+    [ "${n:-0}" -eq 0 ] && { echo "[watchdog] 全部完成，退出" >> "$LOG"; break; }
+    echo "[watchdog $(date +%H:%M:%S)] 第 $i 次启动调度器（待OCR $n 本）" >> "$LOG"
+    "$PY" "$D" run >> "$LOG" 2>&1
+    sleep 3
+  done
+  echo "[watchdog $(date +%H:%M:%S)] 看门狗结束" >> "$LOG"
+' </dev/null >>"$LOG" 2>&1 &
+disown
+echo "已脱离启动（nohup + 看门狗，被kill会自动续跑）。"
+echo "  看进度: tail -f $LOG  或  ~/ocr-tools/ocr-progress"
+echo "  停  止: ~/ocr-tools/ocr-stop"

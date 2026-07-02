@@ -1,0 +1,222 @@
+# paddle-ocr-techniques 本地补丁
+# 上游: https://github.com/anon-research-tools/paddle-ocr-techniques.git
+# 基于提交: f07df1dfba538d8f65532431f9e8efbdecd5abb4 (Rewrite README in Chinese)
+# 导出时间: 2026-06-30
+# 用法: cd paddle-ocr-techniques && git apply ../patches/paddle-ocr-techniques.local.diff
+# ============================================================
+diff --git a/scripts/paddle_vl_batch_ocr.py b/scripts/paddle_vl_batch_ocr.py
+index af0d7e3..bb2d20f 100755
+--- a/scripts/paddle_vl_batch_ocr.py
++++ b/scripts/paddle_vl_batch_ocr.py
+@@ -5,6 +5,7 @@ import argparse
+ import csv
+ import json
+ import os
++import random
+ import re
+ import subprocess
+ import sys
+@@ -30,18 +31,28 @@ DEFAULT_OPTIONAL_PAYLOAD = {
+ TOKEN_ENV_NAME = "PADDLEOCR_ACCESS_TOKEN"
+ REQUEST_RETRIES = 5
+ REQUEST_BACKOFF_SECONDS = 3
++# 这些状态码视为可重试（含 429 限流、408/425 超时与重发、5xx 服务端错误）
++RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
++# 服务端「任务提交队列已满」(code 10010) 用 HTTP 200 返回，必须当可重试处理，否则白丢页。
++# 高并发下队列会瞬时填满，故提交单独给更多次、更长退避。
++SUBMIT_QUEUE_RETRIES = 30
++SUBMIT_QUEUE_BACKOFF_SECONDS = 5
++RETRYABLE_BODY_CODES = {10010}
++RETRYABLE_BODY_KEYWORDS = ("队列已满", "请稍后", "稍后重试", "繁忙", "busy", "try again", "rate limit")
++# 单页 job 的最大等待时间，超过即放弃该页（防止某页卡在 pending/running 永久挂起）
++MAX_JOB_WAIT_SECONDS = 900
+ FINAL_DIR_NAME = "markdown_final_v2"
+ QUALITY_DIR_NAME = "quality_v2"
+ REPORT_NAME = "ocr_quality_report_v2.csv"
+ SUSPICIOUS_LABELS = {"text", "content"}
++# 注意：原版还排除了 "footnote" 与 "aside_text"，但史料/学术书的脚注、旁注常含
++# 出处、编者注、考订等有价值内容，故保留进正文，仅排除页眉页脚页码等版面噪音。
+ EXCLUDED_LABELS = {
+     "header",
+     "number",
+     "footer",
+-    "footnote",
+     "header_image",
+     "footer_image",
+-    "aside_text",
+ }
+ TITLE_LABELS = {"paragraph_title", "doc_title"}
+ IMAGE_LABELS = {"image", "header_image", "footer_image"}
+@@ -177,18 +188,56 @@ def load_access_token() -> str | None:
+     return None
+ 
+ 
++def _retry_after_seconds(response: requests.Response) -> float:
++    """解析 429/503 的 Retry-After 头（秒），无则 0。"""
++    val = response.headers.get("Retry-After")
++    if not val:
++        return 0.0
++    try:
++        return float(val)
++    except ValueError:
++        return 0.0
++
++
++def _submit_jobid(response: requests.Response) -> str | None:
++    """从提交响应里取 jobId，没有则 None。"""
++    try:
++        data = response.json().get("data")
++    except ValueError:
++        return None
++    if isinstance(data, dict):
++        return data.get("jobId")
++    return None
++
++
++def _is_retryable_body(response: requests.Response) -> bool:
++    """业务层「队列已满/请稍后重试」等：HTTP 200 但应退避重试。"""
++    try:
++        body = response.json()
++    except ValueError:
++        return False
++    if not isinstance(body, dict):
++        return False
++    if body.get("code") in RETRYABLE_BODY_CODES:
++        return True
++    msg = str(body.get("msg", ""))
++    return any(k in msg for k in RETRYABLE_BODY_KEYWORDS)
++
++
+ def request_with_retries(method: str, url: str, **kwargs: Any) -> requests.Response:
+     last_error: Exception | None = None
+     for attempt in range(1, REQUEST_RETRIES + 1):
++        retry_after = 0.0
+         try:
+             response = requests.request(method, url, **kwargs)
+-            if response.status_code < 500:
++            if response.status_code not in RETRY_STATUS:
+                 return response
++            retry_after = _retry_after_seconds(response)
+             last_error = RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
+         except requests.RequestException as exc:
+             last_error = exc
+         if attempt < REQUEST_RETRIES:
+-            time.sleep(REQUEST_BACKOFF_SECONDS * attempt)
++            time.sleep(max(REQUEST_BACKOFF_SECONDS * attempt, retry_after))
+     if last_error:
+         raise last_error
+     raise RuntimeError(f"request failed: {method} {url}")
+@@ -199,7 +248,7 @@ def submit_and_wait(
+     token: str,
+     work_dir: Path,
+     optional_payload: dict[str, Any] | None = None,
+-    poll_interval: int = 5,
++    poll_interval: int = 3,
+     timeout: int = 120,
+ ) -> PaddleResult:
+     ensure_dir(work_dir)
+@@ -212,7 +261,10 @@ def submit_and_wait(
+     }
+     response: requests.Response | None = None
+     last_error: Exception | None = None
+-    for attempt in range(1, REQUEST_RETRIES + 1):
++    # 提交可能多于普通重试次数：队列满(code 10010)只是「稍后重试」，多等几轮即可
++    submit_attempts = max(REQUEST_RETRIES, SUBMIT_QUEUE_RETRIES)
++    for attempt in range(1, submit_attempts + 1):
++        retry_after = 0.0
+         try:
+             with file_path.open("rb") as f:
+                 response = requests.post(
+@@ -222,13 +274,22 @@ def submit_and_wait(
+                     files={"file": (file_path.name, f, mime_type)},
+                     timeout=timeout,
+                 )
+-            if response.status_code < 500:
+-                break
+-            last_error = RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
++            if response.status_code in RETRY_STATUS:
++                retry_after = _retry_after_seconds(response)
++                last_error = RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
++            elif _submit_jobid(response):
++                break  # 拿到 jobId，真正成功
++            elif _is_retryable_body(response):
++                # 业务层「队列已满/请稍后重试」——HTTP 200 也要退避重试，否则白白丢页
++                retry_after = SUBMIT_QUEUE_BACKOFF_SECONDS
++                last_error = RuntimeError(f"submit busy: {response.text[:200]}")
++            else:
++                break  # 非可重试的硬错误，跳出后统一抛
+         except requests.RequestException as exc:
+             last_error = exc
+-        if attempt < REQUEST_RETRIES:
+-            time.sleep(REQUEST_BACKOFF_SECONDS * attempt)
++        if attempt < submit_attempts:
++            # 加抖动，避免多 worker 同步重试再次撞满队列
++            time.sleep(max(REQUEST_BACKOFF_SECONDS * attempt, retry_after) + random.uniform(0, 1.5))
+     if response is None:
+         if last_error:
+             raise last_error
+@@ -236,11 +297,14 @@ def submit_and_wait(
+     (work_dir / "submit_response.txt").write_text(response.text, encoding="utf-8")
+     if response.status_code != 200:
+         raise RuntimeError(f"submit failed: {response.status_code} {response.text[:500]}")
++    job_id = _submit_jobid(response)
++    if not job_id:
++        raise RuntimeError(f"submit failed (no jobId): {response.text[:500]}")
+     submit_payload = response.json()
+-    job_id = submit_payload["data"]["jobId"]
+     write_json(work_dir / "submit_response.json", submit_payload)
+ 
+     latest_status: dict[str, Any] = {}
++    deadline = time.monotonic() + MAX_JOB_WAIT_SECONDS
+     while True:
+         status_response = request_with_retries("GET", f"{JOB_URL}/{job_id}", headers=headers, timeout=timeout)
+         if status_response.status_code != 200:
+@@ -259,6 +323,11 @@ def submit_and_wait(
+             return PaddleResult(job_id=job_id, jsonl_text=jsonl_text, latest_status=latest_status)
+         if state == "failed":
+             raise RuntimeError(f"job failed for {job_id}: {latest_status['data'].get('errorMsg')}")
++        if time.monotonic() > deadline:
++            # 防止某页 job 卡在 pending/running 永久挂起，拖死整本
++            raise RuntimeError(
++                f"job timed out after {MAX_JOB_WAIT_SECONDS}s for {job_id} (state={state})"
++            )
+         time.sleep(poll_interval)
+ 
+ 
+diff --git a/scripts/rebuild_ocr_reports.py b/scripts/rebuild_ocr_reports.py
+index 9333f0e..252030e 100755
+--- a/scripts/rebuild_ocr_reports.py
++++ b/scripts/rebuild_ocr_reports.py
+@@ -188,20 +188,18 @@ def main() -> int:
+     merged_name = args.merged_name or f"{root.name}_merged.md"
+     (root / merged_name).write_text("\n".join(merged_parts).rstrip() + "\n", encoding="utf-8")
+ 
+-    with (root / "ocr_quality_report_v2.csv").open("w", newline="", encoding="utf-8") as f:
+-        writer = csv.DictWriter(f, fieldnames=list(quality_rows[0].keys()))
+-        writer.writeheader()
+-        writer.writerows(quality_rows)
+-
+-    with (root / "ocr_deep_audit_v2.csv").open("w", newline="", encoding="utf-8") as f:
+-        writer = csv.DictWriter(f, fieldnames=list(audit_rows[0].keys()))
+-        writer.writeheader()
+-        writer.writerows(audit_rows)
+-
+-    with (root / "manual_review_list_v2.csv").open("w", newline="", encoding="utf-8") as f:
+-        writer = csv.DictWriter(f, fieldnames=list(review_rows[0].keys()))
+-        writer.writeheader()
+-        writer.writerows(review_rows)
++    def _write_csv(name: str, rows: list) -> None:
++        # 零行时不再越界崩溃（happy path：无缺页/无复核项）
++        with (root / name).open("w", newline="", encoding="utf-8") as f:
++            if not rows:
++                return
++            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
++            writer.writeheader()
++            writer.writerows(rows)
++
++    _write_csv("ocr_quality_report_v2.csv", quality_rows)
++    _write_csv("ocr_deep_audit_v2.csv", audit_rows)
++    _write_csv("manual_review_list_v2.csv", review_rows)
+ 
+     severity_counts = Counter(str(row["severity"]) for row in audit_rows)
+     flag_counts = Counter()
