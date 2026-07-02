@@ -3,7 +3,7 @@
   "name": "Vision OCR",
   "version": "1.0.0",
   "minAppVersion": "1.0.0",
-  "description": "OCR 双引擎调度：自动分流 PaddleOCR-VL（云）与 Apple Vision（本地）给库内未处理的 PDF 做 OCR，加可检索文本层并回填伴生 md。支持后台脱离式启动（看门狗续跑、可关 Obsidian）、只看分流方案，以及两引擎各自单独运行/扫描。调用 ~/ocr-tools 下的 ocr_dispatch.py / paddle_ingest.py / vision_ocr.py。",
+  "description": "OCR 双引擎智能分流：对库内每本待处理 PDF，先用本地 Apple Vision 抽样试跑几页并按「墨多字少/乱码率」打分——读得好的留本地 Vision（省钱离线、顺带补 PDF 文本层），读不好的（竖排/烂扫/乱码）才升级到云端 PaddleOCR-VL；两条流水线并行。支持后台脱离式启动（看门狗续跑、可关 Obsidian）、只看分流方案、各引擎单独运行/扫描。调用 ~/ocr-tools 下的 ocr_dispatch.py / paddle_ingest.py / vision_ocr.py。",
   "author": "local",
   "isDesktopOnly": true
 }
